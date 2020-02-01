@@ -1,7 +1,7 @@
 use env_logger;
 use log;
 
-use libhoney;
+use crate as libhoney;
 use libhoney::Error;
 use libhoney::FieldHolder;
 

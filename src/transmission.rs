@@ -8,12 +8,11 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{
     bounded, Receiver as ChannelReceiver, RecvTimeoutError, Sender as ChannelSender,
 };
-use futures::future::{lazy, Future, IntoFuture};
+
 use log::{error, info};
 use parking_lot::Mutex;
 use reqwest::{header, StatusCode};
 use tokio::runtime::{Builder, Runtime};
-use tokio_timer::clock::Clock;
 
 use crate::errors::{Error, Result};
 use crate::event::Event;
@@ -103,9 +102,9 @@ impl Sender for Transmission {
         info!("transmission starting");
         // thread that processes all the work received
         let runtime = self.runtime.clone();
-        runtime.lock().spawn(lazy(|| {
+        runtime.lock().spawn(async {
             Self::process_work(work_receiver, response_sender, options, user_agent)
-        }));
+        });
     }
 
     fn stop(&mut self) -> Result<()> {
@@ -134,12 +133,13 @@ impl Sender for Transmission {
                 });
         } else {
             let runtime = self.runtime.clone();
-            runtime.lock().spawn(
-                self.work_sender
-                    .clone()
+            let response_sender_inner = self.response_sender.clone();
+            let work_sender_inner = self.work_sender.clone();
+            runtime.lock().spawn(async {
+                work_sender_inner
                     .send_timeout(event.clone(), DEFAULT_SEND_TIMEOUT)
                     .map_err(|e| {
-                        self.response_sender
+                        response_sender_inner
                             .send(Response {
                                 status_code: None,
                                 body: None,
@@ -150,9 +150,8 @@ impl Sender for Transmission {
                             .unwrap_or_else(|e| {
                                 error!("response dropped, error: {}", e);
                             });
-                    })
-                    .into_future(),
-            );
+                    });
+            });
         }
     }
 
@@ -166,15 +165,11 @@ impl Transmission {
     fn new_runtime(options: Option<&Options>) -> Result<Runtime> {
         let mut builder = Builder::new();
         if let Some(opts) = options {
-            builder
-                .blocking_threads(opts.max_concurrent_batches)
-                .core_threads(opts.max_concurrent_batches);
+            builder.core_threads(opts.max_concurrent_batches);
         };
         Ok(builder
-            .clock(Clock::system())
-            .keep_alive(Some(Duration::from_secs(60)))
-            .name_prefix("libhoney-rust")
-            .stack_size(3 * 1024 * 1024)
+            .thread_name("libhoney-rust")
+            .thread_stack_size(3 * 1024 * 1024)
             .build()?)
     }
 
@@ -200,8 +195,8 @@ impl Transmission {
         response_sender: ChannelSender<Response>,
         options: Options,
         user_agent: String,
-    ) -> impl Future<Item = (), Error = ()> {
-        let mut runtime = Self::new_runtime(Some(&options)).expect("Could not start new runtime");
+    ) {
+        let runtime = Self::new_runtime(Some(&options)).expect("Could not start new runtime");
         let mut batches: HashMap<String, Events> = HashMap::new();
         let mut expired = false;
 
@@ -248,7 +243,7 @@ impl Transmission {
                     let batch_response_sender = response_sender.clone();
                     let batch_user_agent = user_agent.to_string();
 
-                    runtime.spawn(lazy(move || {
+                    runtime.spawn(async move {
                         for response in
                             Self::send_batch(batch_copy, options, batch_user_agent, Instant::now())
                         {
@@ -256,8 +251,7 @@ impl Transmission {
                                 .send(response)
                                 .expect("unable to enqueue batch response");
                         }
-                        Ok(()).into_future()
-                    }));
+                    });
                     batches_sent.push(batch_name.to_string())
                 }
             }
@@ -272,13 +266,7 @@ impl Transmission {
                 expired = false;
             }
         }
-        info!("Shutting down batch processing runtime");
-        runtime
-            .shutdown_now()
-            .wait()
-            .expect("unable to shutdown batch processing runtime");
-        info!("Batch processing runtime shut down");
-        Ok(()).into_future()
+        info!("Batch processing runtime shutting down");
     }
 
     fn send_batch(
